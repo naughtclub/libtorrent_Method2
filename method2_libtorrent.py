@@ -13,7 +13,6 @@ import urllib.request
 
 import libtorrent as lt
 
-# Ensure logs print immediately in GitHub Actions in chronological order
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -22,8 +21,6 @@ FALLBACK_TRACKERS = [
     "https://tracker.tamersunion.org:443/announce",
     "https://tracker.gbitt.info:443/announce",
     "http://tracker.gbitt.info:80/announce",
-    "http://open.acgnxtracker.com:80/announce",
-    "https://tr.burnabyhighstar.com:443/announce",
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",
     "udp://tracker.torrent.eu.org:451/announce",
@@ -31,18 +28,19 @@ FALLBACK_TRACKERS = [
 ]
 
 LIVE_TRACKER_LISTS = [
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_http.txt",
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_https.txt",
-    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt",
 ]
 
 METADATA_TIMEOUT_SEC = 60
 PIECE_TIMEOUT_SEC = 60
-CHUNK_SIZE = 512 * 1024  # 512 KB per read step
+CHUNK_SIZE = 512 * 1024  # 512 KB per range step
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi")
 
 
-def fetch_live_trackers(max_trackers=80):
+def fetch_live_trackers(max_trackers=150):
     seen = set()
     trackers = []
 
@@ -59,7 +57,7 @@ def fetch_live_trackers(max_trackers=80):
                     if len(trackers) >= max_trackers:
                         return trackers
         except Exception as e:
-            print(f"Tracker list fetch warning ({url}): {e}")
+            print(f"Tracker list warning ({url}): {e}")
 
     for tr in FALLBACK_TRACKERS:
         if tr not in seen:
@@ -69,10 +67,74 @@ def fetch_live_trackers(max_trackers=80):
     return trackers
 
 
+def try_fetch_cached_torrent(magnet_uri, save_path):
+    """Optional fast path: fetch .torrent metadata from public cache by infohash."""
+    match = re.search(r"xt=urn:btih:([0-9a-fA-F]{40})", magnet_uri)
+    if not match:
+        return None
+    ih = match.group(1).upper()
+    cache_urls = [
+        f"https://itorrents.org/torrent/{ih}.torrent",
+        f"https://torrage.info/torrent.php?h={ih}",
+    ]
+    for url in cache_urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = resp.read()
+            if data and data[:1] == b"d":
+                torrent_path = os.path.join(save_path, f"{ih}.torrent")
+                with open(torrent_path, "wb") as f:
+                    f.write(data)
+                ti = lt.torrent_info(torrent_path)
+                print(f"Loaded .torrent metadata instantly from cache ({url}).")
+                return ti
+        except Exception:
+            continue
+    return None
+
+
 def get_alert_mask():
     if hasattr(lt, "alert_category"):
-        return lt.alert_category.error | lt.alert_category.peer
-    return lt.alert.category_t.error_notification | lt.alert.category_t.peer_notification
+        return lt.alert_category.error | lt.alert_category.peer | lt.alert_category.storage
+    return (
+        lt.alert.category_t.error_notification
+        | lt.alert.category_t.peer_notification
+        | lt.alert.category_t.storage_notification
+    )
+
+
+def wait_for_zero_piece_priorities(ses, handle, target_idx, num_pieces):
+    """Avoid libtorrent race where async file_priority() overwrites prioritize_pieces([0]*N)."""
+    handle.pause()
+
+    current_file_prios = handle.get_file_priorities()
+    if not current_file_prios or current_file_prios[target_idx] == 0:
+        handle.file_priority(target_idx, 1)
+        file_prio_alert_cls = getattr(lt, "file_prio_alert", None)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            got_alert = False
+            for alert in ses.pop_alerts():
+                if file_prio_alert_cls and isinstance(alert, file_prio_alert_cls):
+                    got_alert = True
+            if got_alert:
+                break
+            time.sleep(0.05)
+
+    # Now safely zero every piece and verify before resuming
+    handle.prioritize_pieces([0] * num_pieces)
+    verify_deadline = time.time() + 3.0
+    while time.time() < verify_deadline:
+        prios = handle.get_piece_priorities()
+        if prios and all(p == 0 for p in prios):
+            break
+        time.sleep(0.05)
+
+    # Confirm zeroed count in logs
+    nonzero = sum(1 for p in handle.get_piece_priorities() if p != 0)
+    print(f"Piece priorities locked to 0 before resume (non-zero pieces: {nonzero}).")
+    handle.resume()
 
 
 def probe_video(stream_url):
@@ -133,7 +195,6 @@ class PieceManager:
                 if stop_event.is_set():
                     return False
                 if all(self.handle.have_piece(p) for p in pending):
-                    # Wait briefly if disk thread is still creating the sparse file
                     wait_until = time.time() + 2.0
                     while not os.path.exists(self.file_path) and time.time() < wait_until:
                         time.sleep(0.05)
@@ -142,7 +203,9 @@ class PieceManager:
                     st = self.handle.status()
                     raise TimeoutError(
                         f"Timed out waiting for pieces {pending} "
-                        f"(peers: {st.num_peers}, dl: {st.download_rate / 1024:.1f} KB/s)"
+                        f"(peers: {st.num_peers}/{st.list_peers}, "
+                        f"seeds: {st.num_seeds}/{st.list_seeds}, "
+                        f"dl: {st.download_rate / 1024:.1f} KB/s)"
                     )
                 time.sleep(0.05)
         finally:
@@ -280,11 +343,10 @@ def main():
     save_path = tempfile.mkdtemp(prefix="lt-torrent-")
     tmp_dir = tempfile.mkdtemp(prefix="lt-clips-")
     server = None
-    ses = None
 
     try:
         live_trackers = fetch_live_trackers()
-        print(f"Loaded {len(live_trackers)} live trackers (HTTP/HTTPS + UDP).")
+        print(f"Loaded {len(live_trackers)} live trackers.")
 
         ses = lt.session()
         ses.apply_settings(
@@ -311,57 +373,50 @@ def main():
         params.save_path = save_path
         params.storage_mode = lt.storage_mode_t.storage_mode_sparse
 
-        # Start active immediately (clear BOTH paused and auto_managed),
-        # while default_dont_download prevents downloading payload bytes after metadata arrives
+        cached_ti = try_fetch_cached_torrent(magnet_uri, save_path)
+        if cached_ti is not None:
+            params.ti = cached_ti
+
         flags = params.flags
         if hasattr(lt, "torrent_flags"):
             flags &= ~getattr(lt.torrent_flags, "auto_managed", 0)
-            flags &= ~getattr(lt.torrent_flags, "paused", 0)
             flags |= getattr(lt.torrent_flags, "default_dont_download", 0)
+            if cached_ti is not None:
+                # Already have metadata; keep paused until piece priorities are locked to 0
+                flags |= getattr(lt.torrent_flags, "paused", 0)
+            else:
+                flags &= ~getattr(lt.torrent_flags, "paused", 0)
         params.flags = flags
 
         existing = list(params.trackers)
         params.trackers = existing + [tr for tr in live_trackers if tr not in existing]
 
         handle = ses.add_torrent(params)
-        handle.resume()
+        if cached_ti is None:
+            handle.resume()
 
-        peer_alert_types = tuple(
-            cls
-            for cls in (
-                getattr(lt, "peer_error_alert", None),
-                getattr(lt, "peer_disconnected_alert", None),
-            )
-            if cls is not None
-        )
-        printed_alerts = 0
-        max_printed_alerts = 25
-
-        print(f"Fetching magnet metadata via libtorrent ({len(handle.trackers())} trackers active)...")
-        meta_deadline = time.time() + METADATA_TIMEOUT_SEC
-        last_log = 0.0
-        while not handle.status().has_metadata:
-            for alert in ses.pop_alerts():
-                if peer_alert_types and isinstance(alert, peer_alert_types) and printed_alerts < max_printed_alerts:
-                    print(f"[peer alert] {alert.message()}")
-                    printed_alerts += 1
-
-            now = time.time()
-            st = handle.status()
-            if now > meta_deadline:
-                raise TimeoutError(
-                    f"Metadata timed out after {METADATA_TIMEOUT_SEC}s "
-                    f"(state: {st.state}, peers: {st.num_peers}/{st.list_peers}, "
-                    f"seeds: {st.num_seeds}/{st.list_seeds})"
-                )
-            if now - last_log >= 5.0:
-                print(
-                    f"Waiting for metadata... state: {st.state} | "
-                    f"peers: {st.num_peers} (known: {st.list_peers}) | "
-                    f"seeds: {st.num_seeds} (known: {st.list_seeds})"
-                )
-                last_log = now
-            time.sleep(0.2)
+        if not handle.status().has_metadata:
+            print(f"Fetching magnet metadata via libtorrent ({len(handle.trackers())} trackers active)...")
+            meta_deadline = time.time() + METADATA_TIMEOUT_SEC
+            last_log = 0.0
+            while not handle.status().has_metadata:
+                ses.pop_alerts()
+                now = time.time()
+                st = handle.status()
+                if now > meta_deadline:
+                    raise TimeoutError(
+                        f"Metadata timed out after {METADATA_TIMEOUT_SEC}s "
+                        f"(state: {st.state}, peers: {st.num_peers}/{st.list_peers}, "
+                        f"seeds: {st.num_seeds}/{st.list_seeds})"
+                    )
+                if now - last_log >= 5.0:
+                    print(
+                        f"Waiting for metadata... state: {st.state} | "
+                        f"peers: {st.num_peers} (known: {st.list_peers}) | "
+                        f"seeds: {st.num_seeds} (known: {st.list_seeds})"
+                    )
+                    last_log = now
+                time.sleep(0.2)
 
         info = handle.torrent_file()
         files = info.files()
@@ -377,16 +432,14 @@ def main():
         file_size = files.file_size(target_idx)
         file_path = os.path.join(save_path, files.file_path(target_idx))
 
-        # Enable target file so pieces write directly to disk, then zero all piece priorities
-        handle.pause()
-        handle.file_priority(target_idx, 1)
-        handle.prioritize_pieces([0] * info.num_pieces())
-        handle.resume()
+        # Wait for async file_priority() to finish BEFORE locking all piece priorities to 0
+        wait_for_zero_piece_priorities(ses, handle, target_idx, info.num_pieces())
 
         print(
             f"Metadata ready in {time.time() - start_time:.1f}s | "
             f"File: {files.file_path(target_idx)} ({file_size / 1e6:.2f} MB | "
-            f"piece size: {info.piece_length() / 1024:.0f} KB)"
+            f"piece size: {info.piece_length() / 1024:.0f} KB | "
+            f"total pieces: {info.num_pieces()})"
         )
 
         # Wipe output/ so old files are completely replaced
@@ -412,11 +465,9 @@ def main():
             print(f"Capturing 1s clip at {round(pct * 100)}% ({ts}s)...")
             cmd = ["ffmpeg", "-y", "-ss", ts, "-i", stream_url]
 
-            # Full-res thumbnail from the first sample point (20%) with zero extra download
             if idx == 0:
                 cmd.extend(["-frames:v", "1", "-q:v", "2", thumb_path])
 
-            # 1-second full-res clip (pad guarantees even dimensions for libx264 without scaling)
             cmd.extend(
                 [
                     "-t", "1",
@@ -455,6 +506,7 @@ def main():
 
         st = handle.status()
         handle.pause()
+        pieces_have = sum(1 for i in range(info.num_pieces()) if handle.have_piece(i))
         downloaded_mb = st.total_payload_download / 1e6
         total_mb = file_size / 1e6
         pct_downloaded = (st.total_payload_download / file_size) * 100
@@ -463,6 +515,7 @@ def main():
         print("\n--- METHOD 2 (LIBTORRENT ON-DEMAND FULL-RES) RESULTS ---")
         print(f"Resolution:   {width}x{height} (native)")
         print(f"Elapsed time: {elapsed:.1f}s")
+        print(f"Pieces:       {pieces_have} / {info.num_pieces()}")
         print(f"Downloaded:   {downloaded_mb:.2f} MB / {total_mb:.2f} MB ({pct_downloaded:.2f}%)")
         print("Saved files:  output/thumbnail.jpg, output/preview.mp4")
 
