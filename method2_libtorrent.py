@@ -69,6 +69,12 @@ def fetch_live_trackers(max_trackers=80):
     return trackers
 
 
+def get_alert_mask():
+    if hasattr(lt, "alert_category"):
+        return lt.alert_category.error | lt.alert_category.peer
+    return lt.alert.category_t.error_notification | lt.alert.category_t.peer_notification
+
+
 def probe_video(stream_url):
     proc = subprocess.run(
         [
@@ -283,14 +289,15 @@ def main():
         ses = lt.session()
         ses.apply_settings(
             {
-                "listen_interfaces": "0.0.0.0:6881",
+                "listen_interfaces": "0.0.0.0:0",
                 "enable_dht": True,
-                "enable_lsd": True,
+                "enable_lsd": False,
                 "enable_upnp": False,
                 "enable_natpmp": False,
                 "announce_to_all_trackers": True,
                 "announce_to_all_tiers": True,
                 "connections_limit": 200,
+                "alert_mask": get_alert_mask(),
                 "dht_bootstrap_nodes": (
                     "router.bittorrent.com:6881,"
                     "router.utorrent.com:6881,"
@@ -319,10 +326,26 @@ def main():
         handle = ses.add_torrent(params)
         handle.resume()
 
+        peer_alert_types = tuple(
+            cls
+            for cls in (
+                getattr(lt, "peer_error_alert", None),
+                getattr(lt, "peer_disconnected_alert", None),
+            )
+            if cls is not None
+        )
+        printed_alerts = 0
+        max_printed_alerts = 25
+
         print(f"Fetching magnet metadata via libtorrent ({len(handle.trackers())} trackers active)...")
         meta_deadline = time.time() + METADATA_TIMEOUT_SEC
         last_log = 0.0
         while not handle.status().has_metadata:
+            for alert in ses.pop_alerts():
+                if peer_alert_types and isinstance(alert, peer_alert_types) and printed_alerts < max_printed_alerts:
+                    print(f"[peer alert] {alert.message()}")
+                    printed_alerts += 1
+
             now = time.time()
             st = handle.status()
             if now > meta_deadline:
