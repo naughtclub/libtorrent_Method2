@@ -13,6 +13,10 @@ import urllib.request
 
 import libtorrent as lt
 
+# Ensure logs print immediately in GitHub Actions in chronological order
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 FALLBACK_TRACKERS = [
     "http://tracker.opentrackr.org:1337/announce",
     "https://tracker.tamersunion.org:443/announce",
@@ -123,6 +127,10 @@ class PieceManager:
                 if stop_event.is_set():
                     return False
                 if all(self.handle.have_piece(p) for p in pending):
+                    # Wait briefly if disk thread is still creating the sparse file
+                    wait_until = time.time() + 2.0
+                    while not os.path.exists(self.file_path) and time.time() < wait_until:
+                        time.sleep(0.05)
                     return True
                 if time.time() > deadline:
                     st = self.handle.status()
@@ -154,7 +162,7 @@ def start_range_server(piece_mgr):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt, *args):
-            pass  # Keep CI logs clean
+            pass
 
         def _parse_range(self):
             total = piece_mgr.file_size
@@ -296,36 +304,38 @@ def main():
         params.save_path = save_path
         params.storage_mode = lt.storage_mode_t.storage_mode_sparse
 
-        # Prevent any payload download until we select the video file and zero all piece priorities
+        # Start active immediately (clear BOTH paused and auto_managed),
+        # while default_dont_download prevents downloading payload bytes after metadata arrives
         flags = params.flags
         if hasattr(lt, "torrent_flags"):
             flags &= ~getattr(lt.torrent_flags, "auto_managed", 0)
+            flags &= ~getattr(lt.torrent_flags, "paused", 0)
             flags |= getattr(lt.torrent_flags, "default_dont_download", 0)
         params.flags = flags
 
-        # Merge existing magnet trackers with live trackers (reassignment required for Boost.Python)
         existing = list(params.trackers)
-        merged = existing + [tr for tr in live_trackers if tr not in existing]
-        params.trackers = merged
+        params.trackers = existing + [tr for tr in live_trackers if tr not in existing]
 
         handle = ses.add_torrent(params)
+        handle.resume()
 
-        print("Fetching magnet metadata via libtorrent...")
+        print(f"Fetching magnet metadata via libtorrent ({len(handle.trackers())} trackers active)...")
         meta_deadline = time.time() + METADATA_TIMEOUT_SEC
         last_log = 0.0
         while not handle.status().has_metadata:
             now = time.time()
+            st = handle.status()
             if now > meta_deadline:
-                st = handle.status()
                 raise TimeoutError(
                     f"Metadata timed out after {METADATA_TIMEOUT_SEC}s "
-                    f"(peers: {st.num_peers}, seeds: {st.num_seeds})"
+                    f"(state: {st.state}, peers: {st.num_peers}/{st.list_peers}, "
+                    f"seeds: {st.num_seeds}/{st.list_seeds})"
                 )
             if now - last_log >= 5.0:
-                st = handle.status()
                 print(
-                    f"Waiting for metadata... peers: {st.num_peers} | "
-                    f"seeds: {st.num_seeds} | dht nodes: {ses.status().dht_nodes}"
+                    f"Waiting for metadata... state: {st.state} | "
+                    f"peers: {st.num_peers} (known: {st.list_peers}) | "
+                    f"seeds: {st.num_seeds} (known: {st.list_seeds})"
                 )
                 last_log = now
             time.sleep(0.2)
@@ -344,7 +354,7 @@ def main():
         file_size = files.file_size(target_idx)
         file_path = os.path.join(save_path, files.file_path(target_idx))
 
-        # Activate target file so libtorrent writes to disk (not .parts), but keep all pieces at priority 0
+        # Enable target file so pieces write directly to disk, then zero all piece priorities
         handle.pause()
         handle.file_priority(target_idx, 1)
         handle.prioritize_pieces([0] * info.num_pieces())
