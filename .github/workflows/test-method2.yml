@@ -1,0 +1,39 @@
+name: Test Method 2 (libtorrent Multi-Point Preview)
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnet_link:
+        description: 'Direct Magnet URI'
+        required: true
+      sample_points:
+        description: 'Comma-separated percentages to capture 1s each'
+        required: false
+        default: '20,40,60,80'
+
+permissions:
+  contents: write
+
+jobs:
+  test-method-2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-libtorrent
+
+      - name: Generate full-res thumbnail & multi-point preview
+        run: python3 method2_libtorrent.py "${{ inputs.magnet_link }}" "${{ inputs.sample_points }}"
+
+      - name: Replace output folder in repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A output/
+          git diff --staged --quiet || git commit -m "Replace output with latest libtorrent preview"
+          git pull --rebase
+          git push
